@@ -1,19 +1,28 @@
 /********************************************************
 Copyright owned by Shanghai WithNet ScienTech Co. (Ltd.)
 File name:MySqlSvc.cpp
-Author:qingshan peng  Version:1.0  Date:2014/10/09
+Author:qingshan peng  Version:2.3  Date:2015/03/09
 Description:
-	基础的MYSQL数据库服务实现文件
+	基础的MYSQL数据库服务头文件，为不同模块提供稍便利的数据查询
+功能
 Dependencies:
 Function List: 
 History:
-Author    Date      Detail
+Author			Date		Detail
+qingshan peng	20141223	增加带前置条件的MSS_GetDataPreEx函数.
+qingshan peng	20150108	脱离gint_log.h依赖，直接采用printf
+qingshan peng   20150126	对于数据的插入采用手动提交的方式
+							新增MSS_Insert函数，本方法会根据配置
+							的提交上限主动提交插入事务。
+qingshan peng	20150309	修改MSS_InsertData始终返回正常的bug,
+							改为返回MSS_Insert。
 *********************************************************/
 #include "MySqlSvc.h"
 #include <string.h>
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 #if defined WIN32 || defined _WIN32
 #ifndef _snprintf
 #define _snprintf sprintf_s
@@ -54,6 +63,46 @@ Author    Date      Detail
 		}\
 		return MSS_FAILED;\
 	}
+
+eMSS_RC MSS_Insert(MYSQL_CONNECT *pConnect, char *szSql)
+{
+	int iRes = 0;
+	time_t timer;//time_t就是long int 类型
+	time(&timer);
+	if (NULL == pConnect->pSqlCont) return MSS_FAILED;
+
+	iRes = mysql_query(pConnect->pSqlCont, szSql);
+	if (0 != iRes)
+	{
+		printf("Query mysql faile! cause:%s\n", mysql_error(pConnect->pSqlCont));
+		printf("%s\n", szSql);
+		iRes = mysql_errno(pConnect->pSqlCont);
+		if (2103 == iRes || 2006 == iRes)
+		{
+			MSS_Disconnect(pConnect);
+			iRes = MSS_Connect(pConnect);
+		}
+		return MSS_FAILED;
+	}
+
+	++pConnect->uiQueryCount;
+	if (pConnect->uiQueryCount >= pConnect->uiCommitNumCfg)
+	{
+		mysql_commit(pConnect->pSqlCont);
+		pConnect->uiQueryCount = 0;
+		pConnect->uiCommitTimer = (unsigned int)timer + 120;//延时2分钟
+	}
+	else
+	{
+		//没有到数量上限则看是否超过1分钟没有提交了。
+		if (pConnect->uiCommitTimer < timer)
+		{
+			mysql_commit(pConnect->pSqlCont);
+			pConnect->uiCommitTimer = (unsigned int)timer;
+		}
+	}
+	return MSS_OK;
+}
 /************************************************       
 Function:MSS_Config
 Description:
@@ -65,18 +114,21 @@ char * szMySqlPassword mysql用户密码
 char * szHostName	mysql主机名
 unsigned short usPort	主机端口
 char * szDataBaseName	数据库名称
+unsigned int uiCommitNumCfg		手动提交的上限值
 Output:
 Returns:eMSS_RC
 MSS_OK*
 MSS_BADPARAM*
 History:
+qingshan peng   20150126	添加手动提交插入上限的配置参数
 ************************************************/
 eMSS_RC MSS_Config(MYSQL_CONNECT *pConnect,
 						 char *szMySqlUser,
 						 char *szMySqlPassword,
 						 char *szHostName,
 						 unsigned short usPort,
-						 char *szDataBaseName)
+						 char *szDataBaseName,
+						 unsigned int uiCommitNumCfg)
 {
 	//简单的参数检查
 	if (strlen(szMySqlUser) > 19 ||
@@ -97,6 +149,8 @@ eMSS_RC MSS_Config(MYSQL_CONNECT *pConnect,
 	_snprintf(pConnect->szHostName, sizeof(pConnect->szHostName), "%s", szHostName);
 	pConnect->usPort = usPort;
 	_snprintf(pConnect->szDataBaseName, sizeof(pConnect->szDataBaseName), "%s", szDataBaseName);
+	pConnect->uiCommitNumCfg = uiCommitNumCfg;
+
 	pConnect->pNoChange = pConnect;
 
 	return MSS_OK;
@@ -115,18 +169,21 @@ char * szMySqlPassword mysql用户密码
 char * szHostName	mysql主机名
 unsigned short usPort	主机端口
 char * szDataBaseName	数据库名称
+unsigned int uiCommitNumCfg	手动提交的上限值
 Output:
 Returns:eMSS_RC
 MSS_OK*
 MSS_BADPARAM*
 History:
+qingshan peng   20150126	添加手动提交插入上限的配置参数
 ************************************************/
 eMSS_RC MSS_Create(MYSQL_CONNECT **ppConnect,
 							char *szMySqlUser,
 							char *szMySqlPassword,
 							char *szHostName,
 							unsigned short usPort,
-							char *szDataBaseName)
+							char *szDataBaseName,
+							unsigned int uiCommitNumCfg)
 {
 	//简单的参数检查
 	if (strlen(szMySqlUser) > 19 ||
@@ -152,8 +209,10 @@ eMSS_RC MSS_Create(MYSQL_CONNECT **ppConnect,
 						szMySqlPassword,
 						szHostName,
 						usPort,
-						szDataBaseName);
+						szDataBaseName,
+						uiCommitNumCfg);
 }
+
 /************************************************       
 Function:MSS_Release
 Description:
@@ -232,6 +291,7 @@ eMSS_RC MSS_Connect(MYSQL_CONNECT *pConnect)
 		return MSS_FAILED;
 	}
 	mysql_set_character_set(pConnect->pSqlCont, "utf8");
+	mysql_autocommit(pConnect->pSqlCont, 0);//关闭自动提交
 	return MSS_OK;
 }
 
@@ -498,6 +558,9 @@ MSS_FAILED 插入失败
 MSS_DISCONNECT*
 MSS_BADPARAM*
 History:
+Author			Date		Detail
+qingshan peng	20150309	修改始终返回正常的
+							bug,改为返回MSS_Insert
 ************************************************/
 eMSS_RC MSS_InsertData(MYSQL_CONNECT *pConnect, char *szDataTable, char *szDataField, char *szDataValues)
 {
@@ -531,9 +594,7 @@ eMSS_RC MSS_InsertData(MYSQL_CONNECT *pConnect, char *szDataTable, char *szDataF
 		_snprintf(szSQL, sizeof(szSQL), "insert into %s(%s)  value(%s)", szDataTable, szDataField, szDataValues);
 	}
 
-	MY_QUERY(szSQL);
-
-	return MSS_OK;
+	return MSS_Insert(pConnect, szSQL);
 }
 /************************************************       
 Function:MSS_DeleteData
@@ -629,6 +690,7 @@ eMSS_RC MSS_DoQuery(MYSQL_CONNECT *pConnect, char *szSQL)
 }
 
 #include "sysinc.h"
+
 #ifdef WIN32
 #define MY_LOCK HANDLE
 #define MY_EVENT HANDLE
@@ -649,12 +711,50 @@ struct Item
 {
 	char szSQL[2048];
 	Item *pNext;
+
+	Item *pFree;
 };
+
+Item *pItemPool = NULL;
 
 Item *pHead;
 
 char szSQLSet[1024 * 300];
 unsigned short usNum;
+void CreateItem(Item **ppItemPool, int iNum)
+{
+	Item *pNewItem = NULL;
+	for (int i = 0;i < iNum; ++i)
+	{
+		pNewItem = new Item;
+		memset(pNewItem, 0, sizeof(Item));
+		pNewItem->pFree = (*ppItemPool);
+		(*ppItemPool) = pNewItem;
+	}
+}
+
+Item *GetItem()
+{
+	Item *pItem = NULL;
+	if (!pItemPool)
+	{
+		CreateItem(&pItemPool, 100);
+	}
+	pItem = pItemPool;
+	pItemPool = pItemPool->pFree;
+
+	pItem->pFree = NULL;
+	return pItem;
+}
+
+void ReleaseItem(Item *pItem)
+{
+	pItem->szSQL[0] = 0;
+	pItem->pNext = NULL;
+
+	pItem->pFree = pItemPool;
+	pItemPool = pItem;
+}
 #ifdef WIN32
 void ThreadGetSql(void *pP)
 #else
@@ -662,7 +762,8 @@ void * ThreadGetSql(void *pP)
 #endif
 {
 	MYSQL_CONNECT *pConnect = (MYSQL_CONNECT *)pP;
-	Item *pItem;
+	Item *pItem = NULL;
+	Item *pItemExecutedList = NULL;
 	printf("%s\n", "start");
 	//string SQL;
 	while(1)
@@ -670,32 +771,35 @@ void * ThreadGetSql(void *pP)
 #ifdef WIN32
 		WaitForSingleObject(g_Event, INFINITE);
 		WaitForSingleObject(g_Lock, INFINITE);
-
-		while (pHead)
+		pItemExecutedList = pHead;
+		pHead = NULL;
+		ReleaseMutex(g_Lock);
+		while (pItemExecutedList)
 		{
-			pItem = pHead;
-			pHead = pHead->pNext;
+			pItem = pItemExecutedList;
+			pItemExecutedList = pItemExecutedList->pNext;
 			++usNum;
 			//sprintf(szSQLSet + strlen(szSQLSet), "%s;", pItem->szSQL);
-			MSS_DoQuery(pConnect, pItem->szSQL);
-			delete pItem;
+			MSS_Insert(pConnect, pItem->szSQL);
+			ReleaseItem(pItem);
 		}
-		ReleaseMutex(g_Lock);
 #else
 		pthread_cond_wait(& g_Event, &g_Lock0);
 		pthread_mutex_lock(& g_Lock);
+		pItemExecutedList = pHead;
+		pHead = NULL;
+		pthread_mutex_unlock(&g_Lock);//释放互斥锁
 
-		while (pHead)
+		while (pItemExecutedList)
 		{
-			pItem = pHead;
-			pHead = pHead->pNext;
+			pItem = pItemExecutedList;
+			pItemExecutedList = pItemExecutedList->pNext;
 			//sprintf(szSQLSet + strlen(szSQLSet), "%s;", pItem->szSQL);
 			//printf("%s\n", pItem->szSQL);
-			MSS_DoQuery(pConnect, pItem->szSQL);
-			delete pItem;
-			
+			MSS_Insert(pConnect, pItem->szSQL);
+			ReleaseItem(pItem);
+
 		}
-		pthread_mutex_unlock(&g_Lock);//释放互斥锁
 
 #endif // WIN32
 	}
@@ -703,6 +807,10 @@ void * ThreadGetSql(void *pP)
 }
 void OpenOnceMysqlThread(void *pP)
 {
+
+	//note:初始化一个缓冲池 [1/26/2015 qingshan peng]
+	CreateItem(&pItemPool, 2000);
+
 	if (!g_bInitArry)
 	{
 #ifdef WIN32
@@ -724,6 +832,7 @@ void OpenOnceMysqlThread(void *pP)
 		void *state;
 		//pthread_join(ntid, &state);
 #endif // WIN32
+		g_bInitArry = true;
 	}
 	return;
 }
@@ -731,8 +840,8 @@ void OpenOnceMysqlThread(void *pP)
 void MSS_PutSQL(char *Sql)
 {
 //	string sSQL = Sql;
-	Item *pItem = new Item;
-	memset(pItem, 0 , sizeof(Item));
+	Item *pItem = GetItem();
+//memset(pItem, 0 , sizeof(Item));
 	strcpy(pItem->szSQL, Sql);
 	//printf("%s11\n", Sql);
 #ifdef WIN32
